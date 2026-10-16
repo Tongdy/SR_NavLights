@@ -21,7 +21,7 @@ button{color:#ffd000;border:2px solid #ffd000;font-weight:bold;padding:6px 12px}
 button.on{background:#ffd000;color:#000}
 button.sm{padding:3px 8px;font-size:14px}
 button:focus,input:focus,select:focus{outline:3px solid #fff}
-option:disabled{color:#777}
+option.used{color:#888}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:8px}
 .grid button{padding:10px 6px;text-align:left}
 details{border:1px solid #666;border-radius:6px;margin:6px 0;padding:6px}summary{font-weight:bold;cursor:pointer}
@@ -73,11 +73,23 @@ function num(id,v,a,b){return '<input type="number" id="'+id+'" value="'+v+'" mi
 function chk(id,v,on){return '<input type="checkbox" id="'+id+'"'+(v?' checked':'')+(on?' onchange="'+on+'"':'')+'>';}
 function row(a,b){return '<tr><td>'+a+'</td><td>'+b+'</td></tr>';}
 function act(i){return C.led[i].f<NF;}
-// who uses a pin (other than 'me'): '' = free
-function pinUser(p,me){if(me!=='ip0'&&C.ip[0]==p)return '6-pos input';if(me!=='ip1'&&C.ip[1]==p)return 'toggle input';
- for(let i=0;i<NL;i++)if(me!=='L'+i&&act(i)&&C.led[i].p==p)return C.led[i].n;return '';}
-function pinSel(id,v,me,none){let s='<select id="'+id+'" onchange="rebuild()">'+(none?opt(NONE,'None',v==NONE,0):'');
- PINS.forEach(p=>{const u=pinUser(p,me);s+=opt(p,'GPIO'+p+(u?' - '+esc(u):''),p==v,u&&p!=v);});return s+'</select>';}
+// who uses a pin (other than 'me'): null = free, else {k:'ip0'|'ip1'|'L<i>', t:text}
+function pinOwner(p,me){if(p==NONE)return null;if(me!=='ip0'&&C.ip[0]==p)return {k:'ip0',t:'6-pos switch input'};if(me!=='ip1'&&C.ip[1]==p)return {k:'ip1',t:'toggle input'};
+ for(let i=0;i<NL;i++)if(me!=='L'+i&&act(i)&&C.led[i].p==p)return {k:'L'+i,t:C.led[i].n+' ('+C.fn[C.led[i].f].n+')'};return null;}
+function pinUser(p,me){const o=pinOwner(p,me);return o?o.t:'';}
+function pinSel(id,v,me,none){let s='<select id="'+id+'" data-me="'+me+'" data-prev="'+v+'" onchange="pinPick(this)">'+(none?opt(NONE,'None',v==NONE,0):'');
+ PINS.forEach(p=>{const u=pinUser(p,me);s+='<option value="'+p+'"'+(p==v?' selected':'')+(u&&p!=v?' class="used"':'')+'>GPIO'+p+(u?' - '+esc(u):'')+'</option>';});return s+'</select>';}
+// a used pin can still be picked: confirm, then the old owner gets None
+function pinPick(el){const me=el.dataset.me,p=+el.value,prev=+el.dataset.prev,o=pinOwner(p,me);
+ const who=me=='ip0'?'the 6-pos switch input':me=='ip1'?'the toggle input':C.led[+me.slice(1)].n;
+ readAll();
+ if(o){if(o.k.startsWith('ip')&&!me.startsWith('ip')){alert('GPIO'+p+' is the '+o.t+'.\nMove the input to another pin first.');undoPick(me,prev);build();return;}
+  if(o.k.startsWith('ip')&&me.startsWith('ip')){if(!confirm('GPIO'+p+' is the '+o.t+'.\nSwap the two inputs?')){undoPick(me,prev);build();return;}
+   C.ip[+o.k.slice(2)]=prev;build();msg('Inputs swapped - press Save',1);return;}
+  if(!confirm('GPIO'+p+' is used by '+o.t+'.\nGive GPIO'+p+' to '+who+'? '+C.led[+o.k.slice(1)].n+' will be set to None.')){undoPick(me,prev);build();return;}
+  C.led[+o.k.slice(1)].p=NONE;build();msg(C.led[+o.k.slice(1)].n+' set to None - press Save',1);return;}
+ build();}
+function undoPick(me,prev){if(me=='ip0')C.ip[0]=prev;else if(me=='ip1')C.ip[1]=prev;else C.led[+me.slice(1)].p=prev;}
 function posNames(){const a=['None'];C.fn.forEach((f,i)=>a.push('F'+(i+1)+' '+esc(f.n)));a.push('WiFi (hold)');return a;}
 // ---------- build the page from C ----------
 function build(){
@@ -152,7 +164,7 @@ function addLed(f){readAll();let i=C.led.findIndex(E=>E.f>=NF);if(i<0){msg('All 
 function delLed(i){readAll();const n=C.led[i].n;C.led[i].f=NONE;C.led[i].p=NONE;build();msg(n+' removed - press Save',1);}
 function dimCount(){let n=0;for(let i=0;i<NL;i++)if(act(i)&&C.led[i].p!=NONE&&C.led[i].d)n++;return n;}
 function pdim(el){readAll();if(dimCount()>6){el.checked=false;readAll();msg('Max 6 dimmable LEDs - untick another one first',0);}}
-function pwarn(){const w=[];for(let i=0;i<NL;i++)if(act(i)&&PWARN[C.led[i].p])w.push(esc(C.led[i].n)+' on GPIO'+C.led[i].p+': '+PWARN[C.led[i].p]);
+function pwarn(){const w=[];for(let i=0;i<NL;i++)if(act(i)&&C.led[i].p==NONE)w.push(esc(C.led[i].n)+' ('+esc(C.fn[C.led[i].f].n)+') has no pin');for(let i=0;i<NL;i++)if(act(i)&&PWARN[C.led[i].p])w.push(esc(C.led[i].n)+' on GPIO'+C.led[i].p+': '+PWARN[C.led[i].p]);
  [0,1].forEach(k=>{if(PWARN[C.ip[k]])w.push((k?'Toggle':'6-pos')+' input on GPIO'+C.ip[k]+': '+PWARN[C.ip[k]]);});
  $('pinnote').innerHTML=(C.pd?'<span class="bad">The saved pin map was not valid - the board is using the default pins now.</span><br>':'')+w.map(x=>'<span class="yel">⚠ '+x+'</span>').join('<br>');}
 function check(){if(C.ip[0]==C.ip[1])return '6-pos and toggle inputs are on the same GPIO';
@@ -175,7 +187,7 @@ function save(){readAll();const e=check();if(e){msg('Not saved: '+e,0);return;}
  C.fn.forEach((F,f)=>{p.append('F'+f,[F.s].concat(F.t).join(',')+'|'+F.n);
   F.st.forEach((S,k)=>{const a=[];for(let i=0;i<NL;i++)a.push(S.p[i],S.b[i]);p.append('S'+f+'_'+k,a.join(',')+'|'+S.n);});});
  msg('Saving...',1);
- post('/save',p).then(r=>{msg(r.t,r.ok);if(r.ok)setTimeout(load,/restarting/.test(r.t)?6000:300);}).catch(()=>msg('Not saved: no connection',0));}
+ post('/save',p).then(r=>{msg(r.t,r.ok);if(r.ok)setTimeout(load,300);}).catch(()=>msg('Not saved: no connection',0));}
 function gT(i){post('/gpio',new URLSearchParams({o:i})).then(r=>{if(!r.ok)msg(r.t,0);}).catch(()=>msg('No connection',0));}
 function gEnd(){post('/gpio',new URLSearchParams({end:1})).then(()=>msg('Test ended',1));}
 function bk(){readAll();const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(C,null,1)],{type:'application/json'}));a.download='SR_NavLights_settings_v2.json';a.click();msg('Backup saved',1);}
