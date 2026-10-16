@@ -21,11 +21,14 @@
 //    "ID"          -> SRNAV ID=<board id> VER=<x> ACT=0|1|OFF PK=<key start>
 //    "ACT <code>"  -> SRNAV ACT=OK  /  SRNAV ACT=FAIL <reason>
 //
+//  v2.0.1  Save never restarts the board: new pins / invert / dimmable work
+//          at once. Pin lists: used pins grey but selectable - confirm
+//          gives the pin to the new LED, the old one becomes None.
 //  v1.0.0-v1.0.9: see SR_NavLights v1.0.9 (nav steps, sequence, activation,
 //          USB commands, assignable pins, GitHub build fixes)
 // =====================================================================
 
-#define FW_VERSION "2.0.0"
+#define FW_VERSION "2.0.1"
 
 #include <WiFi.h>
 #include <WebServer.h>
@@ -431,8 +434,9 @@ static String pinMapError(const Cfg& c) {
   return "";
 }
 
-// takes the pin map from the settings (default map if it is bad) - power-up only
+// takes the pin map from the settings (default map if it is bad)
 static void applyPins() {
+  pinsDefault = false;
   const Cfg* src = &cfg;
   Cfg* def = NULL;
   if (pinMapError(cfg).length()) {
@@ -451,6 +455,50 @@ static void applyPins() {
   if (def) { cfg.inPin[0] = def->inPin[0]; cfg.inPin[1] = def->inPin[1]; free(def); }
   statusLedFree = inPin[0] != LED_STATUS && inPin[1] != LED_STATUS;
   for (int i = 0; i < MAX_LED; i++) if (ledPin[i] == LED_STATUS) statusLedFree = false;
+}
+
+static bool pinsUp = false;
+static uint8_t upLedPin[MAX_LED];       // pins set up now (to release them later)
+static bool    upLedPwm[MAX_LED];
+static uint8_t upInPin[2];
+static bool    upStatus = false;
+
+static void writeOut(uint8_t i, float v);
+
+// lets go of every pin set up now (back to a plain input = not driven)
+static void releasePins() {
+  if (!pinsUp) return;
+  for (int k = 0; k < 2; k++) { detachInterrupt(digitalPinToInterrupt(upInPin[k])); pinMode(upInPin[k], INPUT); }
+  for (int i = 0; i < MAX_LED; i++) {
+    if (upLedPin[i] == PIN_NONE) continue;
+    if (upLedPwm[i]) ledcDetach(upLedPin[i]);
+    pinMode(upLedPin[i], INPUT);
+  }
+  if (upStatus) pinMode(LED_STATUS, INPUT);
+  pinsUp = false;
+}
+
+// sets up LEDs, status LED and switch inputs from the settings
+static void setupPins() {
+  releasePins();
+  applyPins();
+  for (int i = 0; i < MAX_LED; i++) {
+    lastDuty[i] = -1;
+    if (ledPin[i] != PIN_NONE) {
+      if (ledPwm[i] && !ledcAttach(ledPin[i], cfg.pwmHz, 10)) ledPwm[i] = false;  // no channel left: on/off
+      if (!ledPwm[i]) pinMode(ledPin[i], OUTPUT);
+      writeOut(i, 0);
+    }
+    upLedPin[i] = ledPin[i];
+    upLedPwm[i] = ledPwm[i];
+  }
+  upStatus = statusLedFree;
+  if (statusLedFree) { pinMode(LED_STATUS, OUTPUT); digitalWrite(LED_STATUS, HIGH); }
+  gotPulse[0] = false; gotPulse[1] = false;                // old input readings no longer count
+  for (int k = 0; k < 2; k++) { upInPin[k] = inPin[k]; pinMode(inPin[k], INPUT_PULLUP); }
+  attachInterrupt(digitalPinToInterrupt(inPin[0]), isrPos, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(inPin[1]), isrTog, CHANGE);
+  pinsUp = true;
 }
 
 // ------------------------------ activation ---------------------------
@@ -900,13 +948,12 @@ static void handleSave() {
   fixState();
   markState();
   if (pinsChanged) {
-    if (cfg.remember) prefs.putBytes("st", &st, sizeof(State));
-    server.sendHeader("Connection", "close");
-    server.send(200, "text/plain", "Saved - restarting to use the new pins (reconnect WiFi if needed)");
-    delay(500);
-    ESP.restart();
+    if (testMode) endTest();
+    setupPins();                                  // new pins work at once, no restart
   }
-  server.send(200, "text/plain", needRestart ? "Saved. Restart the board to use the new WiFi / PWM settings" : "Saved");
+  String m = pinsChanged ? "Saved - new pins are active" : "Saved";
+  if (needRestart) m += ". Press Restart board to use the new WiFi / PWM settings";
+  server.send(200, "text/plain", m);
 }
 
 static void handleGpio() {
@@ -1023,20 +1070,7 @@ void setup() {
   loadState();
   authInit();
 
-  applyPins();
-  for (int i = 0; i < MAX_LED; i++) {
-    lastDuty[i] = -1;
-    if (ledPin[i] == PIN_NONE) continue;
-    if (ledPwm[i] && !ledcAttach(ledPin[i], cfg.pwmHz, 10)) ledPwm[i] = false;  // no channel left: on/off
-    if (!ledPwm[i]) pinMode(ledPin[i], OUTPUT);
-    writeOut(i, 0);
-  }
-  if (statusLedFree) { pinMode(LED_STATUS, OUTPUT); digitalWrite(LED_STATUS, HIGH); }
-
-  pinMode(inPin[0], INPUT_PULLUP);
-  pinMode(inPin[1], INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(inPin[0]), isrPos, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(inPin[1]), isrTog, CHANGE);
+  setupPins();
 
   server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", PAGE); });
   server.on("/cfg", HTTP_GET, handleCfg);
