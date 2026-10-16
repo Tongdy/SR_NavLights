@@ -32,12 +32,13 @@
 //  v1.0.6  GitHub build fix: settings page moved to web_page.h and the
 //          settings carry-over template replaced by a macro (Arduino's
 //          pre-scanner broke on both); no change in how the board works
+//  v1.0.7  new activation key pair (old nav private key lost); no other change
 //  v1.0.4  USB commands for SR Nav Factory (flash + activate in one go):
 //            "ID"          -> SRNAV ID=<board id> VER=<x> ACT=0|1|OFF PK=<key start>
 //            "ACT <code>"  -> SRNAV ACT=OK  /  SRNAV ACT=FAIL <reason>
 // =====================================================================
 
-#define FW_VERSION "1.0.6"
+#define FW_VERSION "1.0.7"
 
 #include <WiFi.h>
 #include <WebServer.h>
