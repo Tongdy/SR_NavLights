@@ -1,4 +1,5 @@
 # SR Nav Lights - builds the ESP32-C3 firmware on GitHub
+# Runs on every upload (push) or by hand: Actions > Build SR Nav Lights > Run workflow
 name: Build SR Nav Lights
 
 on:
