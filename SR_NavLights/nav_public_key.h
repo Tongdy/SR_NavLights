@@ -1,3 +1,2 @@
 // SR Nav Lights - activation public key (safe to share, cannot make codes).
-// Made by nav_keygen.py. All zeros here = activation OFF.
-#define NAV_PUBLIC_KEY_HEX "9d940b20b9aa0e636be570bac182e6d8fbc84af5ee3450cc7e425c050b2249f1"
+#define NAV_PUBLIC_KEY_HEX "1efe04e38df8a3594d3fdb4e3b1f159fe9f59e653ce83771a3e9f1d5225607cf"
