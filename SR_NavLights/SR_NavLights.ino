@@ -1,50 +1,36 @@
 // =====================================================================
-//  SR Nav Lights  -  ESP32-C3 SuperMini LED navigation light controller
+//  SR Nav Lights  -  ESP32-C3 SuperMini LED light controller
 // =====================================================================
-//  Inputs  (receiver PWM 1000-2000 us, internal pull-up):
-//    GPIO0  6-position switch  -> selects the MODE
-//    GPIO1  toggle switch      -> press steps the current mode
-//  Outputs:
-//    GPIO5  Left red nav          GPIO20 Landing light  (PWM)
-//    GPIO6  Right green nav       GPIO21 Tail strobe    (PWM)
-//    GPIO7  Top beacon   (PWM)    GPIO2  Instrument     (PWM)
-//    GPIO10 Bottom strobe         GPIO4  Cockpit        (PWM)
-//                                 GPIO3  Front light    (PWM)
-//    GPIO8  onboard blue LED = status (fast blink: no signal,
-//           slow blink: WiFi on)
-//  Nav position: short press = next slot of the sequence
-//                (or nav back on), hold 3 s = all nav LEDs off.
-//  WiFi: on 60 s after power-up only if no switch moved.
-//        WiFi position + hold toggle 6 s = WiFi on / off.
+//  v2.0.0  FUNCTIONS: up to 5 light functions (e.g. Nav, Landing,
+//          Instrument, Cockpit, Front). Each function has its own LEDs
+//          (name, GPIO, invert, dimmable, offset), its own steps (up to
+//          12: per LED a pattern + brightness) and its own timing.
+//          6-pos switch: each position = a function, WiFi, or nothing.
+//          Toggle in a function position: short press = next step
+//          (on release), hold 3 s = that function off, press again =
+//          back on at the same step. WiFi position: hold 6 s = WiFi
+//          on / off. All functions keep running when the switch moves.
+//          Invert ON by default (pin LOW = LED on). Pin lists only offer
+//          free pins. v1.0.x settings are carried over.
+//  Inputs  (receiver PWM 1000-2000 us, internal pull-up): default
+//          GPIO0 = 6-position switch, GPIO1 = toggle
+//  GPIO8 = onboard blue LED = status (double blink: not activated,
+//          fast blink: no receiver signal, slow blink: WiFi on)
 //  Settings: WiFi "SR_NavLights", open http://192.168.4.1
+//  USB commands for SR Nav Factory (same as v1.0.4):
+//    "ID"          -> SRNAV ID=<board id> VER=<x> ACT=0|1|OFF PK=<key start>
+//    "ACT <code>"  -> SRNAV ACT=OK  /  SRNAV ACT=FAIL <reason>
 //
-//  v1.0.1  momentary toggle, WiFi hold rule, timing per pattern,
-//          GPIO test, backup / restore
-//  v1.0.2  12 nav steps + settable sequence (end = loop to slot 1),
-//          Alt double A/B patterns, new default steps,
-//          nav position: 3 s hold = nav off, step on release
-//  v1.0.3  GPIO test follows Invert (sink / source wiring),
-//          board activation: Ed25519 code for the chip ID, checked at
-//          power-up; not activated = lights off + WiFi page to activate
-//  v1.0.5  every light and both switch inputs assignable to any GPIO
-//          (WiFi page -> Pins), dimmable per light (max 6 = PWM channels),
-//          pin change = automatic restart, bad pin map = default pins
-//  v1.0.6  GitHub build fix: settings page moved to web_page.h and the
-//          settings carry-over template replaced by a macro (Arduino's
-//          pre-scanner broke on both); no change in how the board works
-//  v1.0.7  new activation key pair (old nav private key lost); no other change
-//  v1.0.4  USB commands for SR Nav Factory (flash + activate in one go):
-//            "ID"          -> SRNAV ID=<board id> VER=<x> ACT=0|1|OFF PK=<key start>
-//            "ACT <code>"  -> SRNAV ACT=OK  /  SRNAV ACT=FAIL <reason>
+//  v1.0.0-v1.0.9: see SR_NavLights v1.0.9 (nav steps, sequence, activation,
+//          USB commands, assignable pins, GitHub build fixes)
 // =====================================================================
 
-#define FW_VERSION "1.0.7"
+#define FW_VERSION "2.0.0"
 
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Update.h>
 #include <Preferences.h>
-#include <initializer_list>
 #include "esp_timer.h"
 #include "soc/soc.h"
 #include "soc/gpio_reg.h"
@@ -54,48 +40,86 @@
 
 static_assert(sizeof(NAV_PUBLIC_KEY_HEX) == 65, "NAV_PUBLIC_KEY_HEX must be 64 hex characters");
 
-// ------------------------------ pins ---------------------------------
-#define N_OUT 9
-// default pin map (v1.0.0 - v1.0.4 wiring); the real map is in the settings
-static const uint8_t DEF_OUT_PIN[N_OUT] = {5, 6, 7, 10, 20, 21, 2, 4, 3};
-static const uint8_t DEF_OUT_PWM[N_OUT] = {0, 0, 1, 0, 1, 1, 1, 1, 1};
-static const uint8_t DEF_IN_PIN[2]      = {0, 1};   // 6-pos switch, toggle
-// pins the user may choose (GPIO18/19 = USB, never offered; 11-17 = flash)
-static const uint8_t PIN_OK[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 21};
+// ------------------------------ sizes / codes ------------------------
+#define MAX_LED    11         // LED slots (13 usable GPIOs - 2 inputs)
+#define N_FN       5          // light functions
+#define N_STEP     12         // steps per function
+#define FN_NONE    255        // LED not used by any function
 #define PIN_NONE   255
 #define MAX_PWM    6          // ESP32-C3 has 6 PWM (LEDC) channels
 #define LED_STATUS 8          // onboard LED, active LOW
+// pins the user may choose (GPIO18/19 = USB, never offered; 11-17 = flash)
+static const uint8_t PIN_OK[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 21};
 
-// pin map in use (set once at power-up from the settings)
-static uint8_t outPin[N_OUT];
-static bool    outPwm[N_OUT];
-static volatile uint8_t inPin[2];
-static bool    statusLedFree = true;  // GPIO8 not used by a light / input
-static bool    pinsDefault = false;   // saved map was bad -> default pins
+// 6-pos position: 0 = nothing, 1..5 = function 1..5, 6 = WiFi (hold)
+#define PF_NONE 0
+#define PF_WIFI 6
 
-enum { G_INST = 0, G_COCK = 1, G_FRONT = 2 };
-enum { FN_NONE = 0, FN_NAV, FN_INST, FN_COCK, FN_FRONT, FN_MASTER, FN_WIFI, FN_COUNT };
 enum { P_OFF = 0, P_STEADY, P_SINGLE, P_DOUBLE, P_TRIPLE, P_FADE, P_FAST, P_ALTA, P_ALTB,
        P_ADA, P_ADB, P_COUNT };
 enum { TT_MOM_HIGH = 0, TT_MOM_LOW, TT_2POS, TT_COUNT };
 
-#define NAV_STEPS 12
-#define SEQ_END   255
 #define CFG_MAGIC 0x53524E4CUL
-#define CFG_VER   4
-#define ST_MAGIC  0x53524E33UL
+#define CFG_VER   5
+#define ST_MAGIC  0x53524E35UL
 #define TEST_TIMEOUT_MS 120000UL
 
-struct NavStep {
+// flash pattern timing: [0]=single [1]=double [2]=triple
+struct Flash { uint16_t on, gap, per; };
+
+struct LedC {
+  char     name[17];
+  uint8_t  fn;            // function 0..4, FN_NONE = not used
+  uint8_t  pin;           // GPIO or PIN_NONE
+  uint8_t  inv;           // 1 = LED on when pin LOW
+  uint8_t  dim;           // 1 = PWM (brightness / fade)
+  uint16_t offs;          // pattern offset (ms)
+};
+
+struct StepC {
+  char    name[13];
+  uint8_t pat[MAX_LED];   // pattern per LED slot (only this function's LEDs are used)
+  uint8_t br[MAX_LED];    // brightness % per LED slot
+};
+
+struct FuncC {
+  char     name[17];
+  uint8_t  nSteps;        // 1..12: toggle goes 1..nSteps, then back to 1
+  Flash    fl[3];
+  uint16_t beaconPer, fastPer, altPer;
+  StepC    st[N_STEP];
+};
+
+struct Cfg {
+  uint32_t magic;
+  uint16_t ver;
+  uint16_t posUs[6];      // value of each 6-pos position
+  uint8_t  posFn[6];      // PF_NONE / 1..5 / PF_WIFI
+  uint16_t togHi, togLo;
+  uint16_t posStableMs;
+  uint8_t  togType;
+  uint8_t  offHoldS;      // function position: hold = function off (s)
+  uint8_t  wifiHoldS;     // WiFi position: hold = WiFi on/off (s)
+  uint16_t wifiBootS;
+  uint8_t  wifiIdleMin;
+  uint8_t  inPin[2];      // 6-pos switch, toggle
+  LedC     led[MAX_LED];
+  FuncC    fn[N_FN];
+  uint16_t pwmHz;
+  uint8_t  remember;
+  uint8_t  lowPwr;
+  char     ssid[24];
+  char     pass[24];
+};
+
+// ---- v1.0.2 - v1.0.9 layout, only used to carry settings over ----
+struct NavStepV4 {
   char    name[13];
   uint8_t pat[6];
   uint8_t br[6];
 };
 
-// flash pattern timing: [0]=single [1]=double [2]=triple
-struct Flash { uint16_t on, gap, per; };
-
-struct Cfg {
+struct CfgV4 {
   uint32_t magic;
   uint16_t ver;
   uint16_t posUs[6];
@@ -107,66 +131,42 @@ struct Cfg {
   uint16_t wifiBootS;
   uint8_t  wifiIdleMin;
   uint8_t  navHoldS;      // nav position: hold = nav off (s)
-  NavStep  nav[NAV_STEPS];
-  uint8_t  seq[NAV_STEPS];// step index per slot, SEQ_END = loop back
+  NavStepV4 nav[12];
+  uint8_t  seq[12];   // step index per slot, SEQ_END = loop back
   uint8_t  grpSteps[3];
   Flash    fl[3];
   uint16_t beaconPer, fastPer, altPer;
   uint16_t offs[6];
-  uint8_t  maxPct[N_OUT];
-  uint8_t  inv[N_OUT];
+  uint8_t  maxPct[9];
+  uint8_t  inv[9];
   uint16_t pwmHz;
   uint8_t  remember;
   uint8_t  lowPwr;
   char     ssid[24];
   char     pass[24];
   // ---- v1.0.5 (CFG_VER 4): pin map, appended so v1.0.2-v1.0.4 settings load as they are
-  uint8_t  outPinC[N_OUT];
-  uint8_t  outPwmC[N_OUT];
+  uint8_t  outPinC[9];
+  uint8_t  outPwmC[9];
   uint8_t  inPinC[2];
-};
-
-// ---- older layouts, only used to carry settings over ----
-struct NavStepOld { char name[13]; uint8_t en; uint8_t pat[6]; uint8_t br[6]; };
-struct CfgV1 {            // v1.0.0
-  uint32_t magic; uint16_t ver;
-  uint16_t posUs[6]; uint8_t posFn[6];
-  uint16_t togHi, togLo; uint16_t posStableMs;
-  NavStepOld nav[8];
-  uint8_t  grpSteps[3];
-  uint16_t flashOn, flashGap, strobePer, beaconPer, fastPer, altPer;
-  uint16_t offs[6];
-  uint8_t  maxPct[N_OUT]; uint8_t inv[N_OUT];
-  uint16_t pwmHz; uint8_t remember; uint8_t wifiBootMin; uint8_t lowPwr;
-  char     ssid[24]; char pass[24];
-};
-struct CfgV2 {            // v1.0.1
-  uint32_t magic; uint16_t ver;
-  uint16_t posUs[6]; uint8_t posFn[6];
-  uint16_t togHi, togLo; uint16_t posStableMs;
-  uint8_t  togType; uint8_t wifiHoldS; uint16_t wifiBootS; uint8_t wifiIdleMin;
-  NavStepOld nav[8];
-  uint8_t  grpSteps[3];
-  Flash    fl[3];
-  uint16_t beaconPer, fastPer, altPer;
-  uint16_t offs[6];
-  uint8_t  maxPct[N_OUT]; uint8_t inv[N_OUT];
-  uint16_t pwmHz; uint8_t remember; uint8_t lowPwr;
-  char     ssid[24]; char pass[24];
 };
 
 struct State {
   uint32_t magic;
-  uint8_t  slot;          // current slot in the sequence
-  uint8_t  lvl[3];
-  uint8_t  master;
-  uint8_t  navOff;        // 1 = nav LEDs off (3 s hold)
+  uint8_t  step[N_FN];    // current step of each function
+  uint8_t  off[N_FN];     // 1 = function off (3 s hold)
 };
 
 static Cfg cfg;
 static State st;
 static Preferences prefs;
 static WebServer server(80);
+
+// pin map in use (set once at power-up from the settings)
+static uint8_t ledPin[MAX_LED];
+static bool    ledPwm[MAX_LED];
+static volatile uint8_t inPin[2];
+static bool    statusLedFree = true;
+static bool    pinsDefault = false;
 
 // ------------------------------ inputs -------------------------------
 static volatile uint32_t riseUs[2], widthUs[2], lastUs[2];
@@ -202,119 +202,195 @@ static uint16_t testMask = 0;
 static uint32_t testLastMs = 0;
 static bool     stDirty = false;
 static uint32_t stDirtyT = 0;
-static int32_t  lastDuty[N_OUT];
+static int32_t  lastDuty[MAX_LED];
 
 // ------------------------------ defaults -----------------------------
-static void setStep(int i, const char* n,
-                    std::initializer_list<uint8_t> p, std::initializer_list<uint8_t> b) {
-  NavStep& s = cfg.nav[i];
-  strncpy(s.name, n, sizeof(s.name) - 1);
-  s.name[sizeof(s.name) - 1] = 0;
-  int k = 0; for (uint8_t v : p) if (k < 6) s.pat[k++] = v;
-  k = 0;     for (uint8_t v : b) if (k < 6) s.br[k++] = v;
+static void setName(char* dst, size_t n, const char* src) {
+  strncpy(dst, src, n - 1);
+  dst[n - 1] = 0;
 }
 
-static void defaultSteps() {
-  //            name           L-red     R-green   Beacon    Bottom    Landing   Tail
-  setStep(0, "Normal",       {P_STEADY, P_STEADY, P_FADE,   P_SINGLE, P_OFF,    P_SINGLE}, {100,100,100,100,100,100});
-  setStep(1, "Taxi",         {P_STEADY, P_STEADY, P_FADE,   P_OFF,    P_STEADY, P_STEADY}, {100,100,100,100, 40,100});
-  setStep(2, "Takeoff/Land", {P_STEADY, P_STEADY, P_FADE,   P_DOUBLE, P_STEADY, P_DOUBLE}, {100,100,100,100,100,100});
-  setStep(3, "Double flash", {P_DOUBLE, P_DOUBLE, P_FADE,   P_SINGLE, P_OFF,    P_TRIPLE}, {100,100,100,100,100,100});
-  setStep(4, "Alt double",   {P_ADA,    P_ADB,    P_FADE,   P_SINGLE, P_OFF,    P_TRIPLE}, {100,100,100,100,100,100});
-  setStep(5, "Wig-wag",      {P_ALTA,   P_ALTB,   P_FAST,   P_TRIPLE, P_ALTA,   P_ALTB},   {100,100,100,100,100,100});
-  setStep(6, "Full flash",   {P_FAST,   P_FAST,   P_FAST,   P_FAST,   P_FAST,   P_FAST},   {100,100,100,100,100,100});
-  setStep(7, "Off",          {P_OFF,    P_OFF,    P_OFF,    P_OFF,    P_OFF,    P_OFF},    {100,100,100,100,100,100});
-  for (int i = 8; i < NAV_STEPS; i++) {
-    char n[13]; snprintf(n, sizeof(n), "Spare %d", i + 1);
-    setStep(i, n, {P_OFF, P_OFF, P_OFF, P_OFF, P_OFF, P_OFF}, {100,100,100,100,100,100});
+static void setLed(Cfg& c, int i, const char* name, uint8_t fn, uint8_t pin, uint8_t dim, uint16_t offs) {
+  LedC& L = c.led[i];
+  setName(L.name, sizeof(L.name), name);
+  L.fn = fn; L.pin = pin; L.inv = 1; L.dim = dim; L.offs = offs;
+}
+
+// one step: n LEDs (slot numbers in leds[]) with their pattern and brightness
+static void setStep(Cfg& c, int f, int k, const char* name, int n,
+                    const uint8_t* leds, const uint8_t* pats, const uint8_t* brs) {
+  StepC& S = c.fn[f].st[k];
+  setName(S.name, sizeof(S.name), name);
+  for (int i = 0; i < n; i++) { S.pat[leds[i]] = pats[i]; S.br[leds[i]] = brs ? brs[i] : 100; }
+}
+
+static void defaultTiming(FuncC& F) {
+  for (int k = 0; k < 3; k++) { F.fl[k].on = 50; F.fl[k].gap = 80; F.fl[k].per = 1200; }
+  F.beaconPer = 1000; F.fastPer = 250; F.altPer = 800;
+}
+
+// dimmer function: Off, then 20 % ... 100 % (starts off at the first power-up)
+static void dimmerSteps(Cfg& c, int f, uint8_t led, int levels) {
+  uint8_t p = P_OFF;
+  setStep(c, f, 0, "Off", 1, &led, &p, NULL);
+  for (int k = 0; k < levels; k++) {
+    char n[13]; uint8_t b = (uint8_t)((k + 1) * 100 / levels);
+    snprintf(n, sizeof(n), "%d %%", b);
+    p = P_STEADY;
+    setStep(c, f, k + 1, n, 1, &led, &p, &b);
   }
-  for (int i = 0; i < NAV_STEPS; i++) cfg.seq[i] = (i < 8) ? i : SEQ_END;
+  c.fn[f].nSteps = levels + 1;
 }
 
-static void defaults() {
-  memset(&cfg, 0, sizeof(cfg));
-  cfg.magic = CFG_MAGIC; cfg.ver = CFG_VER;
+static void defaults(Cfg& c) {
+  memset(&c, 0, sizeof(c));
+  c.magic = CFG_MAGIC; c.ver = CFG_VER;
   const uint16_t pu[6] = {1000, 1193, 1398, 1602, 1807, 2000};
-  const uint8_t  pf[6] = {FN_NAV, FN_INST, FN_FRONT, FN_COCK, FN_MASTER, FN_WIFI};
-  for (int i = 0; i < 6; i++) { cfg.posUs[i] = pu[i]; cfg.posFn[i] = pf[i]; }
-  cfg.togHi = 1650; cfg.togLo = 1350; cfg.posStableMs = 200;
-  cfg.togType = TT_MOM_HIGH; cfg.wifiHoldS = 6; cfg.wifiBootS = 60; cfg.wifiIdleMin = 0;
-  cfg.navHoldS = 3;
-  defaultSteps();
-  for (int g = 0; g < 3; g++) cfg.grpSteps[g] = 5;
-  for (int f = 0; f < 3; f++) { cfg.fl[f].on = 50; cfg.fl[f].gap = 80; cfg.fl[f].per = 1200; }
-  cfg.beaconPer = 1000; cfg.fastPer = 250; cfg.altPer = 800;
-  const uint16_t of[6] = {0, 0, 0, 0, 0, 600};
-  for (int o = 0; o < 6; o++) cfg.offs[o] = of[o];
-  for (int o = 0; o < N_OUT; o++) { cfg.maxPct[o] = 100; cfg.inv[o] = 0; }
-  cfg.pwmHz = 1000; cfg.remember = 1; cfg.lowPwr = 1;
-  strcpy(cfg.ssid, "SR_NavLights");
-  strcpy(cfg.pass, "12345678");
-  memcpy(cfg.outPinC, DEF_OUT_PIN, N_OUT);
-  memcpy(cfg.outPwmC, DEF_OUT_PWM, N_OUT);
-  memcpy(cfg.inPinC, DEF_IN_PIN, 2);
+  for (int i = 0; i < 6; i++) { c.posUs[i] = pu[i]; c.posFn[i] = (i < 5) ? i + 1 : PF_WIFI; }
+  c.togHi = 1650; c.togLo = 1350; c.posStableMs = 200;
+  c.togType = TT_MOM_HIGH; c.offHoldS = 3; c.wifiHoldS = 6; c.wifiBootS = 60; c.wifiIdleMin = 0;
+  c.inPin[0] = 0; c.inPin[1] = 1;
+
+  //                   name            fn  pin dim offs
+  setLed(c, 0, "Left red",       0,  5, 0, 0);
+  setLed(c, 1, "Right green",    0,  6, 0, 0);
+  setLed(c, 2, "Top beacon",     0,  7, 1, 0);
+  setLed(c, 3, "Bottom strobe",  0, 10, 0, 0);
+  setLed(c, 4, "Tail strobe",    0, 21, 1, 600);
+  setLed(c, 5, "Landing",        1, 20, 1, 0);
+  setLed(c, 6, "Instrument",     2,  2, 1, 0);
+  setLed(c, 7, "Cockpit",        3,  4, 1, 0);
+  setLed(c, 8, "Front light",    4,  3, 1, 0);
+  setLed(c, 9, "LED 10",   FN_NONE, PIN_NONE, 0, 0);
+  setLed(c, 10, "LED 11",  FN_NONE, PIN_NONE, 0, 0);
+
+  const char* FN_NAMES[N_FN] = {"Nav lights", "Landing", "Instrument", "Cockpit", "Front light"};
+  for (int f = 0; f < N_FN; f++) {
+    setName(c.fn[f].name, sizeof(c.fn[f].name), FN_NAMES[f]);
+    defaultTiming(c.fn[f]);
+    for (int k = 0; k < N_STEP; k++) {
+      char n[13]; snprintf(n, sizeof(n), "Step %d", k + 1);
+      setName(c.fn[f].st[k].name, sizeof(c.fn[f].st[k].name), n);
+      for (int i = 0; i < MAX_LED; i++) c.fn[f].st[k].br[i] = 100;
+    }
+  }
+  // 1 Nav lights: L red, R green, beacon, bottom, tail
+  const uint8_t NV[5] = {0, 1, 2, 3, 4};
+  const uint8_t s1[5] = {P_STEADY, P_STEADY, P_FADE,   P_SINGLE, P_SINGLE};
+  const uint8_t s2[5] = {P_STEADY, P_STEADY, P_FADE,   P_OFF,    P_STEADY};
+  const uint8_t s3[5] = {P_STEADY, P_STEADY, P_FADE,   P_DOUBLE, P_DOUBLE};
+  const uint8_t s4[5] = {P_DOUBLE, P_DOUBLE, P_FADE,   P_SINGLE, P_TRIPLE};
+  const uint8_t s5[5] = {P_ADA,    P_ADB,    P_FADE,   P_SINGLE, P_TRIPLE};
+  const uint8_t s6[5] = {P_ALTA,   P_ALTB,   P_FAST,   P_TRIPLE, P_ALTB};
+  const uint8_t s7[5] = {P_FAST,   P_FAST,   P_FAST,   P_FAST,   P_FAST};
+  const uint8_t s8[5] = {P_OFF,    P_OFF,    P_OFF,    P_OFF,    P_OFF};
+  setStep(c, 0, 0, "Normal",       5, NV, s1, NULL);
+  setStep(c, 0, 1, "Taxi",         5, NV, s2, NULL);
+  setStep(c, 0, 2, "Takeoff/Land", 5, NV, s3, NULL);
+  setStep(c, 0, 3, "Double flash", 5, NV, s4, NULL);
+  setStep(c, 0, 4, "Alt double",   5, NV, s5, NULL);
+  setStep(c, 0, 5, "Wig-wag",      5, NV, s6, NULL);
+  setStep(c, 0, 6, "Full flash",   5, NV, s7, NULL);
+  setStep(c, 0, 7, "Off",          5, NV, s8, NULL);
+  c.fn[0].nSteps = 8;
+  // 2 Landing: Off, On, Taxi 40 %, Wig-wag
+  const uint8_t LD = 5;
+  uint8_t p, b;
+  p = P_OFF;    b = 100; setStep(c, 1, 0, "Off",      1, &LD, &p, &b);
+  p = P_STEADY; b = 100; setStep(c, 1, 1, "On",       1, &LD, &p, &b);
+  p = P_STEADY; b = 40;  setStep(c, 1, 2, "Taxi 40%", 1, &LD, &p, &b);
+  p = P_ALTA;   b = 100; setStep(c, 1, 3, "Wig-wag",  1, &LD, &p, &b);
+  c.fn[1].nSteps = 4;
+  // 3 Instrument, 4 Cockpit, 5 Front light: Off, 20 % ... 100 %
+  dimmerSteps(c, 2, 6, 5);
+  dimmerSteps(c, 3, 7, 5);
+  dimmerSteps(c, 4, 8, 5);
+
+  c.pwmHz = 1000; c.remember = 1; c.lowPwr = 1;
+  strcpy(c.ssid, "SR_NavLights");
+  strcpy(c.pass, "12345678");
 }
 
 static void saveCfg() { prefs.putBytes("cfg", &cfg, sizeof(Cfg)); }
 
-// copies the parts that are the same in every version (nav steps get the new defaults)
-// (a macro, not a template: the Arduino pre-scanner mishandles templates in .ino files)
-#define CARRY_COMMON(o) do { \
-  memcpy(cfg.posUs, o.posUs, sizeof(o.posUs)); \
-  memcpy(cfg.posFn, o.posFn, sizeof(o.posFn)); \
-  cfg.togHi = o.togHi; cfg.togLo = o.togLo; cfg.posStableMs = o.posStableMs; \
-  memcpy(cfg.grpSteps, o.grpSteps, sizeof(o.grpSteps)); \
-  cfg.beaconPer = o.beaconPer; cfg.fastPer = o.fastPer; cfg.altPer = o.altPer; \
-  memcpy(cfg.offs, o.offs, sizeof(o.offs)); \
-  memcpy(cfg.maxPct, o.maxPct, sizeof(o.maxPct)); \
-  memcpy(cfg.inv, o.inv, sizeof(o.inv)); \
-  cfg.pwmHz = o.pwmHz; cfg.remember = o.remember; cfg.lowPwr = o.lowPwr; \
-  memcpy(cfg.ssid, o.ssid, sizeof(o.ssid)); \
-  memcpy(cfg.pass, o.pass, sizeof(o.pass)); \
-} while (0)
+// v1.0.2 - v1.0.9 settings -> functions (nav steps follow the old sequence)
+static void migrateV4(const CfgV4& o, bool hasPins) {
+  defaults(cfg);
+  memcpy(cfg.posUs, o.posUs, sizeof(o.posUs));
+  cfg.togHi = o.togHi; cfg.togLo = o.togLo; cfg.posStableMs = o.posStableMs;
+  cfg.togType = o.togType < TT_COUNT ? o.togType : (uint8_t)TT_MOM_HIGH;
+  cfg.offHoldS = o.navHoldS ? o.navHoldS : 3;
+  cfg.wifiHoldS = o.wifiHoldS ? o.wifiHoldS : 6;
+  cfg.wifiBootS = o.wifiBootS; cfg.wifiIdleMin = o.wifiIdleMin;
+  cfg.pwmHz = o.pwmHz; cfg.remember = o.remember; cfg.lowPwr = o.lowPwr;
+  memcpy(cfg.ssid, o.ssid, sizeof(o.ssid));
+  memcpy(cfg.pass, o.pass, sizeof(o.pass));
+  // old outputs 0..8 -> LED slots (old order: L red, R green, beacon, bottom, landing, tail, instr, cockpit, front)
+  const uint8_t MAP[9] = {0, 1, 2, 3, 5, 4, 6, 7, 8};
+  for (int i = 0; i < 9; i++) {
+    LedC& L = cfg.led[MAP[i]];
+    L.inv = o.inv[i] ? 1 : 0;
+    if (hasPins) { L.pin = o.outPinC[i]; L.dim = o.outPwmC[i] ? 1 : 0; }
+    if (i < 6) L.offs = o.offs[i];
+  }
+  if (hasPins) { cfg.inPin[0] = o.inPinC[0]; cfg.inPin[1] = o.inPinC[1]; }
+  FuncC& N = cfg.fn[0];
+  memcpy(N.fl, o.fl, sizeof(o.fl));
+  N.beaconPer = o.beaconPer; N.fastPer = o.fastPer; N.altPer = o.altPer;
+  // nav steps in the order of the old sequence (old pattern index 0,1,2,3,5 -> LED 0..4)
+  const uint8_t OLDI[5] = {0, 1, 2, 3, 5};
+  int n = 0;
+  for (int k = 0; k < 12 && o.seq[k] < 12; k++) {
+    const NavStepV4& os = o.nav[o.seq[k]];
+    StepC& S = N.st[n];
+    memcpy(S.name, os.name, sizeof(S.name));
+    S.name[sizeof(S.name) - 1] = 0;
+    for (int j = 0; j < 5; j++) {
+      S.pat[j] = os.pat[OLDI[j]] < P_COUNT ? os.pat[OLDI[j]] : (uint8_t)P_OFF;
+      S.br[j] = os.br[OLDI[j]] <= 100 ? os.br[OLDI[j]] : 100;
+    }
+    n++;
+  }
+  if (n) N.nSteps = n;
+  // old dimmer groups (instrument, cockpit, front) -> functions 3, 4, 5
+  const uint8_t GLED[3] = {6, 7, 8};
+  for (int g = 0; g < 3; g++) {
+    int lv = o.grpSteps[g];
+    if (lv < 1 || lv > 10) lv = 5;
+    for (int k = 0; k < N_STEP; k++) cfg.fn[2 + g].st[k].pat[GLED[g]] = P_OFF;
+    dimmerSteps(cfg, 2 + g, GLED[g], lv);
+  }
+}
 
 static void loadCfg() {
   size_t len = prefs.getBytesLength("cfg");
-  static uint8_t buf[sizeof(Cfg) > sizeof(CfgV2) ? sizeof(Cfg) : sizeof(CfgV2)];
-  defaults();
-  if (len < 6 || len > sizeof(buf)) return;
+  defaults(cfg);
+  if (len < 6 || len > sizeof(Cfg) + sizeof(CfgV4)) return;
+  uint8_t* buf = (uint8_t*)malloc(len);
+  if (!buf) return;
   prefs.getBytes("cfg", buf, len);
   uint32_t magic; uint16_t ver;
   memcpy(&magic, buf, 4); memcpy(&ver, buf + 4, 2);
-  if (magic != CFG_MAGIC) return;
-  if (ver == CFG_VER && len == sizeof(Cfg)) { memcpy(&cfg, buf, sizeof(Cfg)); return; }
-  if (ver == 3 && len >= offsetof(Cfg, outPinC) && len < sizeof(Cfg)) {   // from v1.0.2 - v1.0.4
-    memcpy(&cfg, buf, offsetof(Cfg, outPinC));    // same fields, same place; pins keep the defaults
-    cfg.ver = CFG_VER;
-    saveCfg();
-    return;
+  if (magic == CFG_MAGIC) {
+    if (ver == CFG_VER && len == sizeof(Cfg)) {
+      memcpy(&cfg, buf, sizeof(Cfg));
+    } else if (ver == 4 && len == sizeof(CfgV4)) {                  // v1.0.5 - v1.0.9
+      CfgV4* o = (CfgV4*)calloc(1, sizeof(CfgV4));
+      if (o) { memcpy(o, buf, sizeof(CfgV4)); migrateV4(*o, true); saveCfg(); free(o); }
+    } else if (ver == 3 && len >= offsetof(CfgV4, outPinC) && len < sizeof(CfgV4)) {  // v1.0.2 - v1.0.4
+      CfgV4* o = (CfgV4*)calloc(1, sizeof(CfgV4));
+      if (o) { memcpy(o, buf, offsetof(CfgV4, outPinC)); migrateV4(*o, false); saveCfg(); free(o); }
+    }
   }
-  if (ver == 2 && len == sizeof(CfgV2)) {          // from v1.0.1
-    CfgV2 o; memcpy(&o, buf, sizeof(o));
-    CARRY_COMMON(o);
-    cfg.togType = o.togType; cfg.wifiHoldS = o.wifiHoldS;
-    cfg.wifiBootS = o.wifiBootS; cfg.wifiIdleMin = o.wifiIdleMin;
-    memcpy(cfg.fl, o.fl, sizeof(o.fl));
-    saveCfg();
-  } else if (ver == 1 && len == sizeof(CfgV1)) {   // from v1.0.0
-    CfgV1 o; memcpy(&o, buf, sizeof(o));
-    CARRY_COMMON(o);
-    for (int f = 0; f < 3; f++) { cfg.fl[f].on = o.flashOn; cfg.fl[f].gap = o.flashGap; cfg.fl[f].per = o.strobePer; }
-    saveCfg();
-  }
-}
-
-static uint8_t seqLen() {
-  uint8_t n = 0;
-  while (n < NAV_STEPS && cfg.seq[n] < NAV_STEPS) n++;
-  return n;
+  free(buf);
 }
 
 static void fixState() {
-  if (st.slot >= seqLen()) st.slot = 0;
-  for (int g = 0; g < 3; g++) if (st.lvl[g] > cfg.grpSteps[g]) st.lvl[g] = cfg.grpSteps[g];
-  if (st.master > 1) st.master = 0;
-  if (st.navOff > 1) st.navOff = 0;
+  for (int f = 0; f < N_FN; f++) {
+    if (cfg.fn[f].nSteps < 1 || cfg.fn[f].nSteps > N_STEP) cfg.fn[f].nSteps = 1;
+    if (st.step[f] >= cfg.fn[f].nSteps) st.step[f] = 0;
+    if (st.off[f] > 1) st.off[f] = 0;
+  }
 }
 
 static void loadState() {
@@ -334,42 +410,47 @@ static bool pinAllowed(uint8_t p) {
   return false;
 }
 
-// checks a pin map; returns "" when good, otherwise the reason
-static String pinMapError(const uint8_t* op, const uint8_t* pw, const uint8_t* ip) {
-  static const char* const NAMES[N_OUT] = {"Left red", "Right green", "Top beacon", "Bottom strobe", "Landing",
-                                           "Tail strobe", "Instrument", "Cockpit", "Front light"};
+// checks the pin map of a settings set; "" = good, otherwise the reason
+static String pinMapError(const Cfg& c) {
   uint32_t used = 0;
   int pwm = 0;
-  for (int c = 0; c < 2; c++) {
-    if (!pinAllowed(ip[c])) return String(c ? "Toggle" : "6-pos switch") + " input needs a GPIO";
-    if (used & (1UL << ip[c])) return "6-pos switch and toggle are on the same GPIO";
-    used |= 1UL << ip[c];
+  for (int k = 0; k < 2; k++) {
+    if (!pinAllowed(c.inPin[k])) return String(k ? "Toggle" : "6-pos switch") + " input needs a GPIO";
+    if (used & (1UL << c.inPin[k])) return "6-pos switch and toggle are on the same GPIO";
+    used |= 1UL << c.inPin[k];
   }
-  for (int i = 0; i < N_OUT; i++) {
-    if (op[i] == PIN_NONE) continue;
-    if (!pinAllowed(op[i])) return String(NAMES[i]) + ": GPIO not allowed";
-    if (used & (1UL << op[i])) return String(NAMES[i]) + ": GPIO" + op[i] + " is already used";
-    used |= 1UL << op[i];
-    if (pw[i]) pwm++;
+  for (int i = 0; i < MAX_LED; i++) {
+    const LedC& L = c.led[i];
+    if (L.fn >= N_FN || L.pin == PIN_NONE) continue;
+    if (!pinAllowed(L.pin)) return String(L.name) + ": GPIO not allowed";
+    if (used & (1UL << L.pin)) return String(L.name) + ": GPIO" + L.pin + " is already used";
+    used |= 1UL << L.pin;
+    if (L.dim) pwm++;
   }
-  if (pwm > MAX_PWM) return String("Too many dimmable lights (") + pwm + "), max " + MAX_PWM;
+  if (pwm > MAX_PWM) return String("Too many dimmable LEDs (") + pwm + "), max " + MAX_PWM;
   return "";
 }
 
 // takes the pin map from the settings (default map if it is bad) - power-up only
 static void applyPins() {
-  if (pinMapError(cfg.outPinC, cfg.outPwmC, cfg.inPinC).length()) {
+  const Cfg* src = &cfg;
+  Cfg* def = NULL;
+  if (pinMapError(cfg).length()) {
     pinsDefault = true;
-    memcpy(outPin, DEF_OUT_PIN, N_OUT);
-    for (int i = 0; i < N_OUT; i++) outPwm[i] = DEF_OUT_PWM[i];
-    inPin[0] = DEF_IN_PIN[0]; inPin[1] = DEF_IN_PIN[1];
-  } else {
-    memcpy(outPin, cfg.outPinC, N_OUT);
-    for (int i = 0; i < N_OUT; i++) outPwm[i] = cfg.outPwmC[i] != 0;
-    inPin[0] = cfg.inPinC[0]; inPin[1] = cfg.inPinC[1];
+    def = (Cfg*)malloc(sizeof(Cfg));
+    if (def) { defaults(*def); src = def; }
   }
+  for (int i = 0; i < MAX_LED; i++) {
+    const LedC& L = src->led[i];
+    bool used = (L.fn < N_FN) && pinAllowed(L.pin);
+    ledPin[i] = used ? L.pin : PIN_NONE;
+    ledPwm[i] = used && L.dim;
+    if (def) { cfg.led[i].pin = def->led[i].pin; cfg.led[i].dim = def->led[i].dim; cfg.led[i].fn = def->led[i].fn; }
+  }
+  inPin[0] = src->inPin[0]; inPin[1] = src->inPin[1];
+  if (def) { cfg.inPin[0] = def->inPin[0]; cfg.inPin[1] = def->inPin[1]; free(def); }
   statusLedFree = inPin[0] != LED_STATUS && inPin[1] != LED_STATUS;
-  for (int i = 0; i < N_OUT; i++) if (outPin[i] == LED_STATUS) statusLedFree = false;
+  for (int i = 0; i < MAX_LED; i++) if (ledPin[i] == LED_STATUS) statusLedFree = false;
 }
 
 // ------------------------------ activation ---------------------------
@@ -440,22 +521,17 @@ static void wifiStop() {
 }
 
 // ------------------------------ switch actions -----------------------
-static void navNext() {
-  if (st.navOff) { st.navOff = 0; markState(); return; }     // back on at the same slot
-  uint8_t n = seqLen();
-  if (n) st.slot = (st.slot + 1) % n;
-  markState();
+static int fnOfPos(int pos) {             // function of a 6-pos position, -1 = none
+  if (pos < 0) return -1;
+  uint8_t p = cfg.posFn[pos];
+  return (p >= 1 && p <= N_FN) ? p - 1 : -1;
 }
+static bool posIsWifi() { return posCur >= 0 && cfg.posFn[posCur] == PF_WIFI; }
 
-static void doStep(uint8_t pos) {
-  switch (cfg.posFn[pos]) {
-    case FN_NAV:   navNext(); return;
-    case FN_INST:  st.lvl[G_INST]  = (st.lvl[G_INST]  + 1) % (cfg.grpSteps[G_INST]  + 1); break;
-    case FN_COCK:  st.lvl[G_COCK]  = (st.lvl[G_COCK]  + 1) % (cfg.grpSteps[G_COCK]  + 1); break;
-    case FN_FRONT: st.lvl[G_FRONT] = (st.lvl[G_FRONT] + 1) % (cfg.grpSteps[G_FRONT] + 1); break;
-    case FN_MASTER: st.master ^= 1; break;
-    default: return;                            // WiFi position: only the long hold counts
-  }
+static void fnNext(int f) {
+  if (f < 0) return;
+  if (st.off[f]) st.off[f] = 0;                       // back on at the same step
+  else st.step[f] = (st.step[f] + 1) % cfg.fn[f].nSteps;
   markState();
 }
 
@@ -473,8 +549,6 @@ static bool isPressed(int8_t s) {
   if (cfg.togType == TT_MOM_LOW) return s == 0;
   return s == 1;                                // momentary HIGH and 2-position: HIGH = pressed
 }
-
-static bool posIs(uint8_t fn) { return posCur >= 0 && cfg.posFn[posCur] == fn; }
 
 static void readInputs(uint32_t ms) {
   uint32_t nowUs = (uint32_t)esp_timer_get_time();
@@ -496,6 +570,7 @@ static void readInputs(uint32_t ms) {
 
   // toggle: HIGH above togHi, LOW below togLo, between = no change
   bool mom = cfg.togType != TT_2POS;
+  int f = fnOfPos(posCur);
   if (sigOk[1]) {
     int8_t r = togRaw;
     if (sigW[1] > cfg.togHi) r = 1;
@@ -507,13 +582,10 @@ static void readInputs(uint32_t ms) {
       bool p = isPressed(togState);
       if (old >= 0) {                                 // first reading = no action
         bootWifiPending = false;                      // switch moved: no power-up WiFi
-        if (posCur >= 0) {
-          if (!mom) doStep(posCur);                   // 2-position: every flip counts
-          else if (p && !posIs(FN_NAV)) doStep(posCur);              // press
-          else if (!p && pressed && !holdDone && posIs(FN_NAV)) doStep(posCur); // nav: short press, on release
-        }
+        if (!mom) fnNext(f);                                         // 2-position: every flip
+        else if (!p && pressed && !holdDone) fnNext(f);              // short press, on release
       }
-      if (p && !pressed) { pressT = ms; holdDone = (old < 0); }  // held at power-up: no action
+      if (p && !pressed) { pressT = ms; holdDone = (old < 0); }      // held at power-up: no action
       if (!p) holdDone = false;
       pressed = p;
     }
@@ -524,100 +596,92 @@ static void readInputs(uint32_t ms) {
   // long holds
   if (pressed && !holdDone && posCur >= 0) {
     uint32_t held = ms - pressT;
-    if (posIs(FN_WIFI) && held >= (uint32_t)cfg.wifiHoldS * 1000UL) {
+    if (posIsWifi() && held >= (uint32_t)cfg.wifiHoldS * 1000UL) {
       holdDone = true;
       bootWifiPending = false;
       if (wifiOn && authOk) wifiStop(); else wifiStart();   // not activated: WiFi stays on
-    } else if (mom && posIs(FN_NAV) && held >= (uint32_t)cfg.navHoldS * 1000UL) {
+    } else if (mom && f >= 0 && held >= (uint32_t)cfg.offHoldS * 1000UL) {
       holdDone = true;                                // release after this does nothing
-      st.navOff = 1;
+      st.off[f] = 1;
       markState();
     }
   }
 }
 
 // ------------------------------ patterns -----------------------------
-static bool flashOn(const Flash& f, uint8_t n, uint32_t t) {
-  uint32_t per = f.per ? f.per : 1;
+static bool flashOn(const Flash& fl, uint8_t n, uint32_t t) {
+  uint32_t per = fl.per ? fl.per : 1;
   uint32_t ph = t % per;
-  uint32_t cyc = (uint32_t)f.on + f.gap;
+  uint32_t cyc = (uint32_t)fl.on + fl.gap;
   for (uint8_t k = 0; k < n; k++) {
     uint32_t s = k * cyc;
-    if (ph >= s && ph < s + f.on) return true;
+    if (ph >= s && ph < s + fl.on) return true;
   }
   return false;
 }
 
-static float patVal(uint8_t p, uint8_t o, uint32_t ms, bool pwm) {
-  uint32_t t = ms + cfg.offs[o];                // offset for strobe/beacon patterns
+static float patVal(uint8_t p, const FuncC& F, uint16_t offs, uint32_t ms, bool pwm) {
+  uint32_t t = ms + offs;                       // offset for strobe / beacon patterns
   switch (p) {
     case P_STEADY: return 1.0f;
-    case P_SINGLE: return flashOn(cfg.fl[0], 1, t) ? 1.0f : 0.0f;
-    case P_DOUBLE: return flashOn(cfg.fl[1], 2, t) ? 1.0f : 0.0f;
-    case P_TRIPLE: return flashOn(cfg.fl[2], 3, t) ? 1.0f : 0.0f;
-    case P_ADA:    return flashOn(cfg.fl[1], 2, ms) ? 1.0f : 0.0f;                    // no offset:
-    case P_ADB:    return flashOn(cfg.fl[1], 2, ms + cfg.fl[1].per / 2) ? 1.0f : 0.0f; // A and B stay half apart
+    case P_SINGLE: return flashOn(F.fl[0], 1, t) ? 1.0f : 0.0f;
+    case P_DOUBLE: return flashOn(F.fl[1], 2, t) ? 1.0f : 0.0f;
+    case P_TRIPLE: return flashOn(F.fl[2], 3, t) ? 1.0f : 0.0f;
+    case P_ADA:    return flashOn(F.fl[1], 2, ms) ? 1.0f : 0.0f;                     // no offset:
+    case P_ADB:    return flashOn(F.fl[1], 2, ms + F.fl[1].per / 2) ? 1.0f : 0.0f;   // A and B stay half apart
     case P_FADE: {
-      uint32_t per = cfg.beaconPer ? cfg.beaconPer : 1;
+      uint32_t per = F.beaconPer ? F.beaconPer : 1;
       uint32_t ph = t % per;
-      if (!pwm) return (ph < per / 5) ? 1.0f : 0.0f;  // on/off output: short flash
+      if (!pwm) return (ph < per / 5) ? 1.0f : 0.0f;  // on/off LED: short flash
       float x = (float)ph / per;
       return x < 0.5f ? x * 2.0f : (1.0f - x) * 2.0f;
     }
-    case P_FAST: { uint32_t per = cfg.fastPer ? cfg.fastPer : 1; return (ms % per) < per / 2 ? 1.0f : 0.0f; }
-    case P_ALTA: { uint32_t per = cfg.altPer  ? cfg.altPer  : 1; return (ms % per) < per / 2 ? 1.0f : 0.0f; }
-    case P_ALTB: { uint32_t per = cfg.altPer  ? cfg.altPer  : 1; return (ms % per) >= per / 2 ? 1.0f : 0.0f; }
+    case P_FAST: { uint32_t per = F.fastPer ? F.fastPer : 1; return (ms % per) < per / 2 ? 1.0f : 0.0f; }
+    case P_ALTA: { uint32_t per = F.altPer  ? F.altPer  : 1; return (ms % per) < per / 2 ? 1.0f : 0.0f; }
+    case P_ALTB: { uint32_t per = F.altPer  ? F.altPer  : 1; return (ms % per) >= per / 2 ? 1.0f : 0.0f; }
     default: return 0.0f;
   }
 }
 
 static void writeDuty(uint8_t i, int32_t d) {
-  if (outPin[i] == PIN_NONE || d == lastDuty[i]) return;
-  if (outPwm[i]) ledcWrite(outPin[i], d);
-  else digitalWrite(outPin[i], d ? HIGH : LOW);
+  if (ledPin[i] == PIN_NONE || d == lastDuty[i]) return;
+  if (ledPwm[i]) ledcWrite(ledPin[i], d);
+  else digitalWrite(ledPin[i], d ? HIGH : LOW);
   lastDuty[i] = d;
 }
 
+// v = LED brightness 0..1 (LED view); invert is applied here
 static void writeOut(uint8_t i, float v) {
   if (v < 0) v = 0;
   if (v > 1) v = 1;
   int32_t d;
-  if (outPwm[i]) {
+  if (ledPwm[i]) {
     d = (int32_t)(v * v * 1023.0f + 0.5f);      // square curve = even brightness steps
-    if (cfg.inv[i]) d = 1023 - d;
+    if (cfg.led[i].inv) d = 1023 - d;
   } else {
     d = (v > 0.001f) ? 1 : 0;
-    if (cfg.inv[i]) d ^= 1;
+    if (cfg.led[i].inv) d ^= 1;
   }
   writeDuty(i, d);
 }
 
 static void updateOutputs(uint32_t ms) {
-  if (!authOk) {                                // not activated: every LED off
-    for (int i = 0; i < N_OUT; i++) writeOut(i, 0);
-    return;
-  }
-  if (testMode) {                               // GPIO test: LED full on / off, Invert followed
-    for (int i = 0; i < N_OUT; i++) {
-      bool on = testMask & (1 << i);
-      int32_t d = outPwm[i] ? (on ? 1023 : 0) : (on ? 1 : 0);
-      if (cfg.inv[i]) d = outPwm[i] ? 1023 - d : (d ^ 1);
-      writeDuty(i, d);
+  for (int i = 0; i < MAX_LED; i++) {
+    float v = 0;
+    if (authOk) {
+      if (testMode) {
+        v = (testMask & (1 << i)) ? 1.0f : 0.0f;   // GPIO test: LED full on / off
+      } else {
+        int f = cfg.led[i].fn;
+        if (f < N_FN && !st.off[f]) {
+          const FuncC& F = cfg.fn[f];
+          const StepC& S = F.st[st.step[f] < F.nSteps ? st.step[f] : 0];
+          v = patVal(S.pat[i], F, cfg.led[i].offs, ms, ledPwm[i]) * S.br[i] / 100.0f;
+        }
+      }
     }
-    return;
+    writeOut(i, v);
   }
-  float v[N_OUT];
-  for (int i = 0; i < N_OUT; i++) v[i] = 0;
-  if (!st.master) {
-    uint8_t n = seqLen();
-    if (!st.navOff && n) {
-      const NavStep& s = cfg.nav[cfg.seq[st.slot < n ? st.slot : 0]];
-      for (int o = 0; o < 6; o++) v[o] = patVal(s.pat[o], o, ms, outPwm[o]) * s.br[o] / 100.0f;
-    }
-    for (int g = 0; g < 3; g++)
-      v[6 + g] = st.lvl[g] ? (float)st.lvl[g] / cfg.grpSteps[g] : 0.0f;
-  }
-  for (int i = 0; i < N_OUT; i++) writeOut(i, v[i] * cfg.maxPct[i] / 100.0f);
 }
 
 static void statusLed(uint32_t ms) {
@@ -633,52 +697,47 @@ static void statusLed(uint32_t ms) {
 #include "web_page.h"   // the settings page (PAGE)
 
 // ------------------------------ web helpers --------------------------
-static void jArr16(String& j, const char* k, const uint16_t* a, int n) {
-  j += '"'; j += k; j += "\":[";
-  for (int i = 0; i < n; i++) { if (i) j += ','; j += a[i]; }
-  j += "],";
-}
+static void jNum(String& j, const char* k, long v) { j += '"'; j += k; j += "\":"; j += v; j += ','; }
 static void jArr8(String& j, const char* k, const uint8_t* a, int n) {
   j += '"'; j += k; j += "\":[";
   for (int i = 0; i < n; i++) { if (i) j += ','; j += a[i]; }
   j += "],";
 }
-static void jNum(String& j, const char* k, long v) { j += '"'; j += k; j += "\":"; j += v; j += ','; }
+static void jStr(String& j, const char* k, const char* v) { j += '"'; j += k; j += "\":\""; j += v; j += "\","; }
 
 static void handleCfg() {
-  String j; j.reserve(4000);
+  String j; j.reserve(10000);
   j = "{\"ver\":\"" FW_VERSION "\",";
-  jArr16(j, "pu", cfg.posUs, 6);
+  j += "\"pu\":["; for (int i = 0; i < 6; i++) { if (i) j += ','; j += cfg.posUs[i]; } j += "],";
   jArr8(j, "pf", cfg.posFn, 6);
   jNum(j, "th", cfg.togHi); jNum(j, "tl", cfg.togLo); jNum(j, "ps", cfg.posStableMs);
-  jNum(j, "tt", cfg.togType); jNum(j, "wh", cfg.wifiHoldS); jNum(j, "nh", cfg.navHoldS);
+  jNum(j, "tt", cfg.togType); jNum(j, "oh", cfg.offHoldS); jNum(j, "wh", cfg.wifiHoldS);
   jNum(j, "wb", cfg.wifiBootS); jNum(j, "wi", cfg.wifiIdleMin);
-  j += "\"nav\":[";
-  for (int i = 0; i < NAV_STEPS; i++) {
+  jArr8(j, "ip", cfg.inPin, 2);
+  j += "\"led\":[";
+  for (int i = 0; i < MAX_LED; i++) {
+    const LedC& L = cfg.led[i];
     if (i) j += ',';
-    j += "{\"n\":\""; j += cfg.nav[i].name; j += "\",";
-    jArr8(j, "p", cfg.nav[i].pat, 6);
-    j += "\"b\":[";
-    for (int o = 0; o < 6; o++) { if (o) j += ','; j += cfg.nav[i].br[o]; }
+    j += "{"; jStr(j, "n", L.name); jNum(j, "f", L.fn); jNum(j, "p", L.pin); jNum(j, "i", L.inv);
+    jNum(j, "d", L.dim); j += "\"o\":"; j += L.offs; j += "}";
+  }
+  j += "],\"fn\":[";
+  for (int f = 0; f < N_FN; f++) {
+    const FuncC& F = cfg.fn[f];
+    if (f) j += ',';
+    j += "{"; jStr(j, "n", F.name); jNum(j, "s", F.nSteps);
+    j += "\"t\":[";
+    for (int k = 0; k < 3; k++) { if (k) j += ','; j += F.fl[k].on; j += ','; j += F.fl[k].gap; j += ','; j += F.fl[k].per; }
+    j += ','; j += F.beaconPer; j += ','; j += F.fastPer; j += ','; j += F.altPer; j += "],\"st\":[";
+    for (int k = 0; k < N_STEP; k++) {
+      if (k) j += ',';
+      j += "{"; jStr(j, "n", F.st[k].name); jArr8(j, "p", F.st[k].pat, MAX_LED);
+      j += "\"b\":["; for (int i = 0; i < MAX_LED; i++) { if (i) j += ','; j += F.st[k].br[i]; } j += "]}";
+    }
     j += "]}";
   }
   j += "],";
-  jArr8(j, "seq", cfg.seq, NAV_STEPS);
-  jArr8(j, "g", cfg.grpSteps, 3);
-  j += "\"fl\":[";
-  for (int f = 0; f < 3; f++) {
-    if (f) j += ',';
-    j += '['; j += cfg.fl[f].on; j += ','; j += cfg.fl[f].gap; j += ','; j += cfg.fl[f].per; j += ']';
-  }
-  j += "],";
-  jNum(j, "bp", cfg.beaconPer); jNum(j, "fp", cfg.fastPer); jNum(j, "ap", cfg.altPer);
-  jArr16(j, "of", cfg.offs, 6);
-  jArr8(j, "mx", cfg.maxPct, N_OUT);
-  jArr8(j, "iv", cfg.inv, N_OUT);
-  jArr8(j, "op", cfg.outPinC, N_OUT);
-  jArr8(j, "pw", cfg.outPwmC, N_OUT);
-  jArr8(j, "ip", cfg.inPinC, 2);
-  jArr8(j, "rp", outPin, N_OUT);           // pins in use now
+  jArr8(j, "rp", ledPin, MAX_LED);           // pins in use now
   j += "\"ri\":["; j += inPin[0]; j += ','; j += inPin[1]; j += "],";
   jNum(j, "pd", pinsDefault);
   jNum(j, "hz", cfg.pwmHz); jNum(j, "rm", cfg.remember); jNum(j, "lp", cfg.lowPwr);
@@ -687,21 +746,17 @@ static void handleCfg() {
 }
 
 static void handleLive() {
-  String j; j.reserve(360);
-  uint8_t n = seqLen();
-  uint8_t si = n ? cfg.seq[st.slot < n ? st.slot : 0] : 0;
+  String j; j.reserve(400);
   j = "{";
   jNum(j, "s0", sigOk[0]); jNum(j, "w0", sigW[0]);
   jNum(j, "s1", sigOk[1]); jNum(j, "w1", sigW[1]);
   jNum(j, "pos", posCur + 1); jNum(j, "tog", togState); jNum(j, "pr", pressed);
-  jNum(j, "sl", st.slot); jNum(j, "sn", n); jNum(j, "si", si); jNum(j, "no", st.navOff);
-  jArr8(j, "lv", st.lvl, 3);
-  jArr8(j, "g", cfg.grpSteps, 3);
-  jNum(j, "m", st.master);
+  jArr8(j, "fs", st.step, N_FN);
+  jArr8(j, "fo", st.off, N_FN);
+  jNum(j, "wf", wifiOn);
   jNum(j, "tm", testMode); jNum(j, "tb", testMask);
   jNum(j, "au", authOk); jNum(j, "ao", authOff); jNum(j, "kb", authKeyBad);
-  j += "\"id\":\""; j += boardId; j += "\",";
-  j += "\"nn\":\""; j += cfg.nav[si].name; j += "\"}";
+  j += "\"id\":\""; j += boardId; j += "\"}";
   server.send(200, "application/json", j);
 }
 
@@ -713,89 +768,134 @@ static long argNum(const char* k, long lo, long hi, long cur) {
   return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// copies a text field, keeping only safe characters; returns length (-1 = not sent)
-static int argText(const char* k, char* dst, size_t n) {
-  if (!server.hasArg(k)) return -1;
-  String s = server.arg(k);
+// copies text, keeping only safe characters; returns length
+static int cleanText(const char* src, char* dst, size_t n) {
   size_t j = 0;
-  for (size_t i = 0; i < s.length() && j < n - 1; i++) {
-    char c = s[i];
-    if (c < 32 || c > 126 || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&') continue;
+  for (size_t i = 0; src[i] && j < n - 1; i++) {
+    char c = src[i];
+    if (c < 32 || c > 126 || c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' || c == '|') continue;
     dst[j++] = c;
   }
   dst[j] = 0;
   return (int)j;
 }
+// copies a text field; returns length (-1 = not sent)
+static int argText(const char* k, char* dst, size_t n) {
+  if (!server.hasArg(k)) return -1;
+  return cleanText(server.arg(k).c_str(), dst, n);
+}
+
+// "1,2,3|name": reads up to max numbers before '|'; returns count, *rest = text after '|'
+static int parseList(const char* s, long* out, int max, const char** rest) {
+  int n = 0;
+  const char* p = s;
+  *rest = "";
+  while (*p && *p != '|' && n < max) {
+    char* e;
+    long v = strtol(p, &e, 10);
+    if (e == p) break;
+    out[n++] = v;
+    p = e;
+    if (*p == ',') p++;
+  }
+  const char* bar = strchr(s, '|');
+  if (bar) *rest = bar + 1;
+  return n;
+}
+static long clampL(long v, long lo, long hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 static void handleSave() {
-  Cfg n = cfg;
+  Cfg* n = (Cfg*)malloc(sizeof(Cfg));
+  if (!n) { server.send(500, "text/plain", "Not saved: out of memory"); return; }
+  memcpy(n, &cfg, sizeof(Cfg));
   char key[12];
   for (int i = 0; i < 6; i++) {
-    snprintf(key, sizeof(key), "pu%d", i); n.posUs[i] = argNum(key, 800, 2200, n.posUs[i]);
-    snprintf(key, sizeof(key), "pf%d", i); n.posFn[i] = argNum(key, 0, FN_COUNT - 1, n.posFn[i]);
+    snprintf(key, sizeof(key), "pu%d", i); n->posUs[i] = argNum(key, 800, 2200, n->posUs[i]);
+    snprintf(key, sizeof(key), "pf%d", i); n->posFn[i] = argNum(key, 0, PF_WIFI, n->posFn[i]);
   }
-  n.togHi = argNum("th", 1000, 2000, n.togHi);
-  n.togLo = argNum("tl", 1000, 2000, n.togLo);
-  n.posStableMs = argNum("ps", 20, 2000, n.posStableMs);
-  n.togType = argNum("tt", 0, TT_COUNT - 1, n.togType);
-  n.wifiHoldS = argNum("wh", 2, 30, n.wifiHoldS);
-  n.navHoldS = argNum("nh", 1, 10, n.navHoldS);
-  n.wifiBootS = argNum("wb", 0, 600, n.wifiBootS);
-  n.wifiIdleMin = argNum("wi", 0, 60, n.wifiIdleMin);
-  if (n.togLo >= n.togHi) { server.send(400, "text/plain", "Not saved: toggle LOW must be below HIGH"); return; }
-  for (int i = 0; i < NAV_STEPS; i++) {
-    NavStep& s = n.nav[i];
-    char nm[13];
-    snprintf(key, sizeof(key), "n%dn", i);
-    int l = argText(key, nm, sizeof(nm));
-    if (l > 0) strcpy(s.name, nm); else if (l == 0) snprintf(s.name, sizeof(s.name), "Step %d", i + 1);
-    for (int o = 0; o < 6; o++) {
-      snprintf(key, sizeof(key), "n%dp%d", i, o); s.pat[o] = argNum(key, 0, P_COUNT - 1, s.pat[o]);
-      snprintf(key, sizeof(key), "n%db%d", i, o); s.br[o]  = argNum(key, 0, 100, s.br[o]);
+  n->togHi = argNum("th", 1000, 2000, n->togHi);
+  n->togLo = argNum("tl", 1000, 2000, n->togLo);
+  n->posStableMs = argNum("ps", 20, 2000, n->posStableMs);
+  n->togType = argNum("tt", 0, TT_COUNT - 1, n->togType);
+  n->offHoldS = argNum("oh", 1, 10, n->offHoldS);
+  n->wifiHoldS = argNum("wh", 2, 30, n->wifiHoldS);
+  n->wifiBootS = argNum("wb", 0, 600, n->wifiBootS);
+  n->wifiIdleMin = argNum("wi", 0, 60, n->wifiIdleMin);
+  n->inPin[0] = argNum("ip0", 0, 255, n->inPin[0]);
+  n->inPin[1] = argNum("ip1", 0, 255, n->inPin[1]);
+  long v[2 * MAX_LED + 4];
+  const char* rest;
+  for (int i = 0; i < MAX_LED; i++) {                     // L<i> = fn,pin,inv,dim,offs|name
+    snprintf(key, sizeof(key), "L%d", i);
+    if (!server.hasArg(key)) continue;
+    String a = server.arg(key);
+    if (parseList(a.c_str(), v, 5, &rest) != 5) continue;
+    LedC& L = n->led[i];
+    L.fn   = (v[0] >= 0 && v[0] < N_FN) ? v[0] : FN_NONE;
+    L.pin  = (L.fn != FN_NONE && pinAllowed((uint8_t)clampL(v[1], 0, 255))) ? v[1] : PIN_NONE;
+    L.inv  = v[2] ? 1 : 0;
+    L.dim  = v[3] ? 1 : 0;
+    L.offs = clampL(v[4], 0, 10000);
+    char nm[sizeof(L.name)];
+    if (cleanText(rest, nm, sizeof(nm)) > 0) strcpy(L.name, nm);
+  }
+  for (int f = 0; f < N_FN; f++) {                        // F<f> = steps,timing x12|name
+    FuncC& F = n->fn[f];
+    snprintf(key, sizeof(key), "F%d", f);
+    if (server.hasArg(key)) {
+      String a = server.arg(key);
+      if (parseList(a.c_str(), v, 13, &rest) == 13) {
+        F.nSteps = clampL(v[0], 1, N_STEP);
+        for (int k = 0; k < 3; k++) {
+          F.fl[k].on  = clampL(v[1 + 3 * k], 10, 5000);
+          F.fl[k].gap = clampL(v[2 + 3 * k], 10, 5000);
+          F.fl[k].per = clampL(v[3 + 3 * k], 50, 10000);
+        }
+        F.beaconPer = clampL(v[10], 50, 10000);
+        F.fastPer   = clampL(v[11], 20, 10000);
+        F.altPer    = clampL(v[12], 20, 10000);
+        char nm[sizeof(F.name)];
+        if (cleanText(rest, nm, sizeof(nm)) > 0) strcpy(F.name, nm);
+      }
+    }
+    for (int k = 0; k < N_STEP; k++) {                    // S<f>_<k> = p0,b0,p1,b1,...|name
+      snprintf(key, sizeof(key), "S%d_%d", f, k);
+      if (!server.hasArg(key)) continue;
+      String a = server.arg(key);
+      if (parseList(a.c_str(), v, 2 * MAX_LED, &rest) != 2 * MAX_LED) continue;
+      StepC& S = F.st[k];
+      for (int i = 0; i < MAX_LED; i++) {
+        S.pat[i] = clampL(v[2 * i], 0, P_COUNT - 1);
+        S.br[i]  = clampL(v[2 * i + 1], 0, 100);
+      }
+      char nm[13];
+      if (cleanText(rest, nm, sizeof(nm)) > 0) strcpy(S.name, nm);
     }
   }
-  bool ended = false;
-  for (int k = 0; k < NAV_STEPS; k++) {
-    snprintf(key, sizeof(key), "q%d", k);
-    long v = argNum(key, 0, 255, n.seq[k]);
-    if (v >= NAV_STEPS) v = SEQ_END;
-    if (ended) v = SEQ_END;                     // everything after the first end is end
-    if (v == SEQ_END) ended = true;
-    n.seq[k] = v;
-  }
-  if (n.seq[0] == SEQ_END) { server.send(400, "text/plain", "Not saved: nav sequence slot 1 needs a step"); return; }
-  for (int g = 0; g < 3; g++) { snprintf(key, sizeof(key), "g%d", g); n.grpSteps[g] = argNum(key, 1, 10, n.grpSteps[g]); }
-  for (int f = 0; f < 3; f++) {
-    snprintf(key, sizeof(key), "f%do", f); n.fl[f].on  = argNum(key, 10, 5000, n.fl[f].on);
-    snprintf(key, sizeof(key), "f%dg", f); n.fl[f].gap = argNum(key, 10, 5000, n.fl[f].gap);
-    snprintf(key, sizeof(key), "f%dp", f); n.fl[f].per = argNum(key, 50, 10000, n.fl[f].per);
-  }
-  n.beaconPer = argNum("bp", 50, 10000, n.beaconPer);
-  n.fastPer   = argNum("fp", 20, 10000, n.fastPer);
-  n.altPer    = argNum("ap", 20, 10000, n.altPer);
-  for (int o = 0; o < 6; o++) { snprintf(key, sizeof(key), "of%d", o); n.offs[o] = argNum(key, 0, 10000, n.offs[o]); }
-  for (int o = 0; o < N_OUT; o++) {
-    snprintf(key, sizeof(key), "mx%d", o); n.maxPct[o] = argNum(key, 0, 100, n.maxPct[o]);
-    snprintf(key, sizeof(key), "iv%d", o); n.inv[o]    = argNum(key, 0, 1, n.inv[o]);
-    snprintf(key, sizeof(key), "op%d", o); n.outPinC[o] = argNum(key, 0, 255, n.outPinC[o]);
-    snprintf(key, sizeof(key), "pw%d", o); n.outPwmC[o] = argNum(key, 0, 1, n.outPwmC[o]);
-  }
-  n.remember = argNum("rm", 0, 1, n.remember);
-  n.lowPwr   = argNum("lp", 0, 1, n.lowPwr);
-  n.pwmHz    = argNum("hz", 100, 20000, n.pwmHz);
+  n->remember = argNum("rm", 0, 1, n->remember);
+  n->lowPwr   = argNum("lp", 0, 1, n->lowPwr);
+  n->pwmHz    = argNum("hz", 100, 20000, n->pwmHz);
   char tmp[24];
-  if (argText("ss", tmp, sizeof(tmp)) > 0) strcpy(n.ssid, tmp);
+  if (argText("ss", tmp, sizeof(tmp)) > 0) strcpy(n->ssid, tmp);
   int pl = argText("pw", tmp, sizeof(tmp));
-  if (pl > 0 && pl < 8) { server.send(400, "text/plain", "Not saved: WiFi password needs 8+ characters"); return; }
-  if (pl >= 8) strcpy(n.pass, tmp);
 
-  for (int c = 0; c < 2; c++) { snprintf(key, sizeof(key), "ip%d", c); n.inPinC[c] = argNum(key, 0, 255, n.inPinC[c]); }
-  String pe = pinMapError(n.outPinC, n.outPwmC, n.inPinC);
-  if (pe.length()) { server.send(400, "text/plain", "Not saved: " + pe); return; }
-  bool pinsChanged = memcmp(n.outPinC, cfg.outPinC, N_OUT) || memcmp(n.outPwmC, cfg.outPwmC, N_OUT) ||
-                     memcmp(n.inPinC, cfg.inPinC, 2);
-  bool needRestart = (n.pwmHz != cfg.pwmHz) || strcmp(n.ssid, cfg.ssid) || strcmp(n.pass, cfg.pass);
-  cfg = n;
+  String err;
+  if (n->togLo >= n->togHi) err = "toggle LOW must be below HIGH";
+  else if (pl > 0 && pl < 8) err = "WiFi password needs 8+ characters";
+  else err = pinMapError(*n);
+  if (err.length()) { free(n); server.send(400, "text/plain", "Not saved: " + err); return; }
+  if (pl >= 8) strcpy(n->pass, tmp);
+
+  bool pinsChanged = n->inPin[0] != cfg.inPin[0] || n->inPin[1] != cfg.inPin[1];
+  for (int i = 0; i < MAX_LED; i++) {
+    const LedC& a = n->led[i];
+    const LedC& b = cfg.led[i];
+    bool ua = a.fn < N_FN && a.pin != PIN_NONE, ub = b.fn < N_FN && b.pin != PIN_NONE;
+    if (ua != ub || (ua && (a.pin != b.pin || a.dim != b.dim))) pinsChanged = true;
+  }
+  bool needRestart = (n->pwmHz != cfg.pwmHz) || strcmp(n->ssid, cfg.ssid) || strcmp(n->pass, cfg.pass);
+  memcpy(&cfg, n, sizeof(Cfg));
+  free(n);
   saveCfg();
   fixState();
   markState();
@@ -812,8 +912,8 @@ static void handleSave() {
 static void handleGpio() {
   if (!authOk) { server.send(403, "text/plain", "Not activated"); return; }
   if (server.hasArg("end")) { endTest(); server.send(200, "text/plain", "Test ended"); return; }
-  long o = argNum("o", -1, N_OUT - 1, -1);
-  if (o < 0) { server.send(400, "text/plain", "Bad output"); return; }
+  long o = argNum("o", -1, MAX_LED - 1, -1);
+  if (o < 0) { server.send(400, "text/plain", "Bad LED"); return; }
   if (!testMode) { testMode = true; testMask = 0; }
   testMask ^= (1 << o);
   testLastMs = millis();
@@ -924,11 +1024,11 @@ void setup() {
   authInit();
 
   applyPins();
-  for (int i = 0; i < N_OUT; i++) {
+  for (int i = 0; i < MAX_LED; i++) {
     lastDuty[i] = -1;
-    if (outPin[i] == PIN_NONE) continue;
-    if (outPwm[i] && !ledcAttach(outPin[i], cfg.pwmHz, 10)) outPwm[i] = false;  // no channel left: on/off
-    if (!outPwm[i]) pinMode(outPin[i], OUTPUT);
+    if (ledPin[i] == PIN_NONE) continue;
+    if (ledPwm[i] && !ledcAttach(ledPin[i], cfg.pwmHz, 10)) ledPwm[i] = false;  // no channel left: on/off
+    if (!ledPwm[i]) pinMode(ledPin[i], OUTPUT);
     writeOut(i, 0);
   }
   if (statusLedFree) { pinMode(LED_STATUS, OUTPUT); digitalWrite(LED_STATUS, HIGH); }
