@@ -1,0 +1,47 @@
+# SR Nav Lights - builds the ESP32-C3 firmware on GitHub
+name: Build SR Nav Lights
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Cache ESP32 tools
+        uses: actions/cache@v4
+        with:
+          path: ~/.arduino15
+          key: arduino-esp32-3.0.7
+
+      - name: Install ESP32 core 3.0.7 (fixed version)
+        run: |
+          URL=https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index --additional-urls $URL
+          arduino-cli core install esp32:esp32@3.0.7 --additional-urls $URL
+
+      - name: Compile
+        run: |
+          arduino-cli compile \
+            --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc,FlashMode=dio,PartitionScheme=default \
+            --export-binaries --output-dir out SR_NavLights
+          ls -la out
+
+      - name: Name the files with the version
+        run: |
+          VER=$(grep -oP '#define FW_VERSION\s+"\K[^"]+' SR_NavLights/SR_NavLights.ino)
+          mkdir dist
+          cp out/SR_NavLights.ino.merged.bin dist/SR_NavLights_v${VER}_USB.bin
+          cp out/SR_NavLights.ino.bin        dist/SR_NavLights_v${VER}_WiFi.bin
+          echo "VER=$VER" >> $GITHUB_ENV
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SR_NavLights_v${{ env.VER }}
+          path: dist/
